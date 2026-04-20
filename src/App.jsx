@@ -19,7 +19,10 @@ const loadScript = (src) => new Promise((resolve, reject) => {
   document.head.appendChild(s);
 });
 
-const buildCaptureHtml = (userHtml, w, h) => /<!doctype html>|<html[\s>]/i.test(userHtml) ? userHtml : `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=${w},initial-scale=1"><style>*,*::before,*::after{box-sizing:border-box}html,body{margin:0;width:${w}px;height:${h}px;overflow:hidden;background:transparent}</style></head><body>${userHtml}</body></html>`;
+const buildCaptureHtml = (userHtml, w, h) =>
+  /<!doctype html>|<html[\s>]/i.test(userHtml)
+    ? userHtml
+    : `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=${w},initial-scale=1"><style>*,*::before,*::after{box-sizing:border-box}html,body{margin:0;width:${w}px;height:${h}px;overflow:hidden;background:transparent}</style></head><body>${userHtml}</body></html>`;
 
 const S = {
   root: { minHeight: "100vh", background: "linear-gradient(145deg,#fdf4ff 0%,#f0f9ff 55%,#fff7ed 100%)", fontFamily: "'Nunito','Segoe UI',sans-serif", padding: "22px 18px 40px", position: "relative", overflow: "hidden" },
@@ -52,6 +55,7 @@ export default function App() {
   const [fps, setFps] = useState(18);
   const [duration, setDuration] = useState(3);
   const [quality, setQuality] = useState(3);
+  const [animSpeed, setAnimSpeed] = useState(1.0);
   const [loop, setLoop] = useState(true);
   const [customW, setCustomW] = useState(480);
   const [customH, setCustomH] = useState(854);
@@ -64,6 +68,12 @@ export default function App() {
   const captureContainerRef = useRef(null);
   const scriptsReady = useRef(false);
   const lastGifUrl = useRef(null);
+
+  // Use refs to always read latest settings inside async callbacks — fixes stale closure bugs
+  const settingsRef = useRef({ fps, duration, quality, loop, animSpeed });
+  useEffect(() => {
+    settingsRef.current = { fps, duration, quality, loop, animSpeed };
+  }, [fps, duration, quality, loop, animSpeed]);
 
   const tpl = TEMPLATES[templateKey];
   const W = templateKey === "custom" ? customW : tpl.w;
@@ -97,76 +107,156 @@ export default function App() {
     if (!scriptsReady.current || phase !== "idle") return;
     const container = captureContainerRef.current;
     if (!container) return;
+
+    // Snapshot current settings at the moment convert is clicked — prevents drift
+    const { fps: capFps, duration: capDuration, quality: capQuality, loop: capLoop, animSpeed: capAnimSpeed } = settingsRef.current;
+    const capTotalFrames = Math.max(1, Math.ceil(capFps * capDuration));
+    // gifshot interval is seconds per frame
+    const frameIntervalSec = 1 / capFps;
+    // ms to wait between captures so animations advance at real speed
+    const frameDelayMs = Math.max(16, Math.round(1000 / capFps));
+
     setPhase("capturing");
     setProgress(0);
     setGifUrl(null);
     setErrorMsg("");
     container.innerHTML = "";
+
     const iframe = document.createElement("iframe");
     iframe.sandbox = "allow-scripts allow-same-origin";
     iframe.scrolling = "no";
     iframe.style.cssText = `width:${W}px;height:${H}px;border:none;display:block;position:absolute;top:0;left:0;overflow:hidden;transform:scale(${BASE_W / W});transform-origin:top left;background:transparent`;
     container.appendChild(iframe);
+
     const doc = iframe.contentDocument || iframe.contentWindow?.document;
     doc.open();
     doc.write(buildCaptureHtml(html, W, H));
     doc.close();
+
+    // Wait for fonts + initial animations to settle
     await new Promise(r => setTimeout(r, 1200));
+
+    // Inject animation speed override — scales all CSS animation durations globally
+    // animSpeed < 1 = slower (e.g. 0.5 = half speed), > 1 = faster
+    if (capAnimSpeed !== 1.0) {
+      try {
+        const captureDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        const styleEl = captureDoc.createElement("style");
+        // Use animation-duration override via factor — divide duration by speed so 0.5x = twice as long
+        const factor = 1 / capAnimSpeed;
+        styleEl.textContent = `*, *::before, *::after { animation-duration: calc(var(--anim-dur, 1s) * ${factor.toFixed(4)}) !important; animation-play-state: running !important; }`;
+        // Better approach: override via playback rate on each animation
+        // Instead inject a script that patches all running animations
+        styleEl.textContent = "";
+        const scriptEl = captureDoc.createElement("script");
+        scriptEl.textContent = `
+          (function() {
+            const factor = ${factor.toFixed(6)};
+            function patchAnims(root) {
+              const els = root.querySelectorAll('*');
+              els.forEach(el => {
+                const anims = el.getAnimations ? el.getAnimations() : [];
+                anims.forEach(a => { try { a.playbackRate = ${capAnimSpeed.toFixed(6)}; } catch(e){} });
+              });
+            }
+            patchAnims(document);
+            // Re-patch after a tick for any deferred animations
+            setTimeout(() => patchAnims(document), 100);
+            setTimeout(() => patchAnims(document), 400);
+          })();
+        `;
+        captureDoc.head.appendChild(scriptEl);
+      } catch(e) { /* sandbox may block, graceful fallback */ }
+    }
+
     const frames = [];
-    const frameDelay = Math.max(16, Math.round(1000 / fps));
+
     try {
-      for (let i = 0; i < totalFrames; i++) {
+      for (let i = 0; i < capTotalFrames; i++) {
         const captureDoc = iframe.contentDocument || iframe.contentWindow?.document;
         const target = captureDoc.querySelector(".ad") || captureDoc.body;
+
+        // Wait for fonts inside iframe
         await captureDoc.fonts?.ready?.catch?.(() => {});
+        // Sync to animation frame for smoothest capture
         await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
         const rect = target.getBoundingClientRect();
         const scale = W / rect.width;
+
         const canvas = await window.html2canvas(target, {
-          width: rect.width, height: rect.height, windowWidth: rect.width, windowHeight: rect.height,
-          scrollX: 0, scrollY: 0, x: 0, y: 0, scale, useCORS: true, allowTaint: true, backgroundColor: null,
-          logging: false, foreignObjectRendering: true,
+          width: rect.width,
+          height: rect.height,
+          windowWidth: rect.width,
+          windowHeight: rect.height,
+          scrollX: 0,
+          scrollY: 0,
+          x: 0,
+          y: 0,
+          scale,
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: null,
+          logging: false,
+          foreignObjectRendering: true,
         });
+
+        // Ensure output canvas is exactly W×H
         let out = canvas;
         if (canvas.width !== W || canvas.height !== H) {
           out = document.createElement("canvas");
-          out.width = W; out.height = H;
+          out.width = W;
+          out.height = H;
           out.getContext("2d").drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, W, H);
         }
+
         frames.push(out.toDataURL("image/png"));
-        setProgress(Math.round(((i + 1) / totalFrames) * 60));
-        await new Promise(r => setTimeout(r, frameDelay));
+
+        // Progress: capturing = 0–65%
+        setProgress(Math.round(((i + 1) / capTotalFrames) * 65));
+
+        // Wait exactly one frame's worth of time so animations advance correctly
+        await new Promise(r => setTimeout(r, frameDelayMs));
       }
+
       setPhase("encoding");
-      setProgress(63);
-      window.gifshot.createGIF({
-        images: frames,
-        gifWidth: W,
-        gifHeight: H,
-        interval: 1 / fps,
-        numWorkers: Math.min(8, navigator.hardwareConcurrency || 4),
-        quality,
-        repeat: loop ? 0 : -1,
-        progressCallback: p => setProgress(63 + Math.round(p * 37)),
-      }, (obj) => {
-        container.innerHTML = "";
-        if (obj.error) {
-          setErrorMsg(obj.errorMsg || "GIF generation failed");
-          setPhase("error");
-          return;
+      setProgress(66);
+
+      window.gifshot.createGIF(
+        {
+          images: frames,
+          gifWidth: W,
+          gifHeight: H,
+          // interval = seconds between frames — must match capture rate
+          interval: frameIntervalSec,
+          numWorkers: Math.min(8, navigator.hardwareConcurrency || 4),
+          // gifshot quality: 1 = best, higher = faster/worse. Use snapshotted value.
+          quality: capQuality,
+          // 0 = loop forever, -1 = no loop
+          repeat: capLoop ? 0 : -1,
+          progressCallback: p => setProgress(66 + Math.round(p * 34)),
+        },
+        (obj) => {
+          container.innerHTML = "";
+          if (obj.error) {
+            setErrorMsg(obj.errorMsg || "GIF generation failed");
+            setPhase("error");
+            return;
+          }
+          if (lastGifUrl.current) URL.revokeObjectURL(lastGifUrl.current);
+          setGifUrl(obj.image);
+          lastGifUrl.current = obj.image;
+          setPhase("done");
+          setProgress(100);
         }
-        if (lastGifUrl.current) URL.revokeObjectURL(lastGifUrl.current);
-        setGifUrl(obj.image);
-        lastGifUrl.current = obj.image;
-        setPhase("done");
-        setProgress(100);
-      });
+      );
     } catch (err) {
       setErrorMsg(err?.message || "Capture failed");
       container.innerHTML = "";
       setPhase("error");
     }
-  }, [fps, duration, W, H, quality, loop, phase, totalFrames, html]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, html, W, H]);
 
   const download = useCallback(() => {
     if (!gifUrl) return;
@@ -177,45 +267,269 @@ export default function App() {
   }, [gifUrl, tpl.label, W, H]);
 
   const isConverting = phase === "capturing" || phase === "encoding";
+  const capturedFrameCount = isConverting && phase === "capturing"
+    ? Math.min(totalFrames, Math.max(0, Math.round((progress / 65) * totalFrames)))
+    : totalFrames;
 
   return (
     <div style={S.root}>
       <style>{`*{box-sizing:border-box}textarea:focus{border-color:#c4b5fd!important;outline:none}input[type=range]{-webkit-appearance:none;appearance:none;height:5px;border-radius:99px;outline:none;cursor:pointer;background:#e2e8f0}input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;border-radius:50%;background:white;box-shadow:0 2px 7px rgba(0,0,0,0.18);border:2px solid #a78bfa;cursor:pointer}.mbtn:hover{transform:translateY(-1px);filter:brightness(1.08)}.mbtn:active{transform:scale(.98)}.tcard{transition:all .15s;cursor:pointer}.tcard:hover{transform:translateY(-2px)}`}</style>
-      <div ref={captureContainerRef} style={{ position: "fixed", left: "-9999px", top: 0, overflow: "hidden", pointerEvents: "none", zIndex: -1 }} />
+
+      {/* Off-screen capture sandbox */}
+      <div
+        ref={captureContainerRef}
+        style={{ position: "fixed", left: "-9999px", top: 0, overflow: "hidden", pointerEvents: "none", zIndex: -1 }}
+      />
+
       <div style={S.blob1} />
       <div style={S.blob2} />
+
+      {/* Header */}
       <div style={S.header}>
-        <div style={S.logo}><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" fill="white" /></svg></div>
-        <div><h1 style={S.title}>HTML → Reel GIF</h1><p style={S.sub}>Export at exact social media dimensions</p></div>
+        <div style={S.logo}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" fill="white" />
+          </svg>
+        </div>
+        <div>
+          <h1 style={S.title}>HTML → Reel GIF</h1>
+          <p style={S.sub}>Export at exact social media dimensions</p>
+        </div>
         <div style={S.pills}>
           <span style={S.pill}>{totalFrames} frames · {fps}fps · {duration}s</span>
           <span style={S.pill}>{W} × {H}px</span>
-          <span style={{ ...S.pill, background: libStatus === "ready" ? "#dcfce7" : libStatus === "error" ? "#fee2e2" : "#fef9c3", color: libStatus === "ready" ? "#15803d" : libStatus === "error" ? "#b91c1c" : "#a16207" }}>{libStatus}</span>
+          <span style={{
+            ...S.pill,
+            background: libStatus === "ready" ? "#dcfce7" : libStatus === "error" ? "#fee2e2" : "#fef9c3",
+            color: libStatus === "ready" ? "#15803d" : libStatus === "error" ? "#b91c1c" : "#a16207"
+          }}>{libStatus}</span>
         </div>
       </div>
+
+      {/* Template picker */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 16, position: "relative", zIndex: 1 }}>
         {Object.entries(TEMPLATES).map(([key, t]) => {
           const active = templateKey === key;
-          return <div key={key} className="tcard" onClick={() => { setTemplateKey(key); reset(); }} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 16, border: active ? "2px solid #a78bfa" : "1.5px solid rgba(0,0,0,0.07)", background: active ? "rgba(167,139,250,0.1)" : "rgba(255,255,255,0.88)", boxShadow: active ? "0 0 0 3px rgba(167,139,250,0.18)" : "none" }}><div style={{ width: 32, height: 32, borderRadius: 8, flexShrink: 0, background: t.color, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontSize: 10, fontWeight: 900, color: "white", letterSpacing: -0.5 }}>{t.icon}</span></div><div style={{ flex: 1, minWidth: 0 }}><p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: "#334155", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{t.label}</p><p style={{ margin: 0, fontSize: 10, color: "#94a3b8", fontWeight: 600 }}>{t.sub}</p></div></div>;
+          return (
+            <div
+              key={key}
+              className="tcard"
+              onClick={() => { setTemplateKey(key); reset(); }}
+              style={{
+                display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 16,
+                border: active ? "2px solid #a78bfa" : "1.5px solid rgba(0,0,0,0.07)",
+                background: active ? "rgba(167,139,250,0.1)" : "rgba(255,255,255,0.88)",
+                boxShadow: active ? "0 0 0 3px rgba(167,139,250,0.18)" : "none"
+              }}
+            >
+              <div style={{ width: 32, height: 32, borderRadius: 8, flexShrink: 0, background: t.color, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <span style={{ fontSize: 10, fontWeight: 900, color: "white", letterSpacing: -0.5 }}>{t.icon}</span>
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <p style={{ margin: 0, fontSize: 12, fontWeight: 800, color: "#334155", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{t.label}</p>
+                <p style={{ margin: 0, fontSize: 10, color: "#94a3b8", fontWeight: 600 }}>{t.sub}</p>
+              </div>
+            </div>
+          );
         })}
       </div>
-      {templateKey === "custom" && <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12, position: "relative", zIndex: 1 }}><div style={{ ...S.card, padding: "12px 16px", gap: 6 }}><div style={{ display: "flex", justifyContent: "space-between" }}><span style={S.sliderLabel}>Width</span><span style={S.sliderVal}>{customW}px</span></div><input type="range" min={100} max={2000} step={10} value={customW} onChange={(e) => setCustomW(Number(e.target.value))} style={{ width: "100%" }} /></div><div style={{ ...S.card, padding: "12px 16px", gap: 6 }}><div style={{ display: "flex", justifyContent: "space-between" }}><span style={S.sliderLabel}>Height</span><span style={S.sliderVal}>{customH}px</span></div><input type="range" min={100} max={4000} step={10} value={customH} onChange={(e) => setCustomH(Number(e.target.value))} style={{ width: "100%" }} /></div></div>}
+
+      {/* Custom size sliders */}
+      {templateKey === "custom" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12, position: "relative", zIndex: 1 }}>
+          {[{ label: "Width", val: customW, set: setCustomW, min: 100, max: 2000 }, { label: "Height", val: customH, set: setCustomH, min: 100, max: 4000 }].map(({ label, val, set, min, max }) => (
+            <div key={label} style={{ ...S.card, padding: "12px 16px", gap: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={S.sliderLabel}>{label}</span>
+                <span style={S.sliderVal}>{val}px</span>
+              </div>
+              <input type="range" min={min} max={max} step={10} value={val} onChange={e => { set(Number(e.target.value)); reset(); }} style={{ width: "100%" }} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Main grid */}
       <div style={S.grid}>
+        {/* Left: code + settings */}
         <div style={S.card}>
-          <div style={S.tabRow}>{["code", "settings"].map((t) => <button key={t} style={{ ...S.tab, ...(activeTab === t ? S.tabActive : {}) }} onClick={() => setActiveTab(t)}>{t === "code" ? "⌨ Code" : "⚙ Settings"}</button>)}</div>
-          {activeTab === "code" && <textarea value={html} onChange={(e) => { setHtml(e.target.value); reset(); }} style={S.editor} spellCheck={false} placeholder="Paste your HTML animation here…" />}
-          {activeTab === "settings" && <div style={{ display: "flex", flexDirection: "column", gap: 18, flex: 1 }}>{[{ label: "FPS", val: fps, set: setFps, min: 6, max: 30, step: 1, unit: " fps" }, { label: "Duration", val: duration, set: setDuration, min: 0.5, max: 12, step: 0.5, unit: "s" }, { label: "Quality (1=best)", val: quality, set: setQuality, min: 1, max: 30, step: 1, unit: "" }].map(({ label, val, set, min, max, step, unit }) => <div key={label}><div style={{ display: "flex", justifyContent: "space-between", marginBottom: 7 }}><span style={S.sliderLabel}>{label}</span><span style={S.sliderVal}>{val}{unit}</span></div><input type="range" min={min} max={max} step={step} value={val} onChange={(e) => set(Number(e.target.value))} style={{ width: "100%" }} /></div>)}<div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><span style={S.sliderLabel}>Loop GIF</span><div onClick={() => setLoop(!loop)} style={{ width: 48, height: 24, borderRadius: 12, cursor: "pointer", position: "relative", flexShrink: 0, background: loop ? "linear-gradient(135deg,#a78bfa,#f472b6)" : "#e2e8f0", transition: "background 0.3s" }}><div style={{ position: "absolute", top: 2, width: 20, height: 20, background: "white", borderRadius: "50%", transition: "transform 0.3s", transform: loop ? "translateX(26px)" : "translateX(2px)", boxShadow: "0 2px 5px rgba(0,0,0,0.2)" }} /></div></div></div>}
+          <div style={S.tabRow}>
+            {["code", "settings"].map(t => (
+              <button key={t} style={{ ...S.tab, ...(activeTab === t ? S.tabActive : {}) }} onClick={() => setActiveTab(t)}>
+                {t === "code" ? "⌨ Code" : "⚙ Settings"}
+              </button>
+            ))}
+          </div>
+
+          {activeTab === "code" && (
+            <textarea
+              value={html}
+              onChange={e => { setHtml(e.target.value); reset(); }}
+              style={S.editor}
+              spellCheck={false}
+              placeholder="Paste your HTML animation here…"
+            />
+          )}
+
+          {activeTab === "settings" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 18, flex: 1 }}>
+              {[
+                { label: "FPS", val: fps, set: setFps, min: 1, max: 30, step: 0.5, unit: " fps", hint: "Lower = fewer frames, smaller file" },
+                { label: "Duration", val: duration, set: setDuration, min: 0.5, max: 12, step: 0.5, unit: "s", hint: null },
+                { label: "Quality (1 = best)", val: quality, set: setQuality, min: 1, max: 20, step: 1, unit: "", hint: "Lower = sharper, slower encode" },
+              ].map(({ label, val, set, min, max, step, unit, hint }) => (
+                <div key={label}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: hint ? 2 : 7 }}>
+                    <span style={S.sliderLabel}>{label}</span>
+                    <span style={S.sliderVal}>{val}{unit}</span>
+                  </div>
+                  {hint && <p style={{ margin: "0 0 6px", fontSize: 10, color: "#94a3b8", fontWeight: 600 }}>{hint}</p>}
+                  <input type="range" min={min} max={max} step={step} value={val}
+                    onChange={e => { set(Number(e.target.value)); reset(); }} style={{ width: "100%" }} />
+                </div>
+              ))}
+
+              {/* Animation speed */}
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                  <span style={S.sliderLabel}>Animation speed</span>
+                  <span style={S.sliderVal}>{animSpeed.toFixed(2)}×</span>
+                </div>
+                <p style={{ margin: "0 0 6px", fontSize: 10, color: "#94a3b8", fontWeight: 600 }}>
+                  {animSpeed < 1 ? `${(1/animSpeed).toFixed(1)}× slower — animations stretched out` : animSpeed > 1 ? `${animSpeed.toFixed(1)}× faster — animations sped up` : "Normal speed"}
+                </p>
+                <input type="range" min={0.1} max={3} step={0.05} value={animSpeed}
+                  onChange={e => { setAnimSpeed(Number(e.target.value)); reset(); }} style={{ width: "100%" }} />
+                {/* Speed presets */}
+                <div style={{ display: "flex", gap: 5, marginTop: 7, flexWrap: "wrap" }}>
+                  {[
+                    { label: "¼×", val: 0.25 },
+                    { label: "½×", val: 0.5 },
+                    { label: "¾×", val: 0.75 },
+                    { label: "1×", val: 1.0 },
+                    { label: "1.5×", val: 1.5 },
+                    { label: "2×", val: 2.0 },
+                  ].map(p => (
+                    <button
+                      key={p.label}
+                      onClick={() => { setAnimSpeed(p.val); reset(); }}
+                      style={{
+                        flex: 1, padding: "5px 0", border: "none", borderRadius: 8, fontFamily: "inherit",
+                        fontWeight: 800, fontSize: 11, cursor: "pointer", transition: "all 0.15s",
+                        background: Math.abs(animSpeed - p.val) < 0.01 ? "linear-gradient(135deg,#a78bfa,#f472b6)" : "#f1f5f9",
+                        color: Math.abs(animSpeed - p.val) < 0.01 ? "white" : "#64748b",
+                      }}
+                    >{p.label}</button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Loop toggle */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={S.sliderLabel}>Loop GIF</span>
+                <div
+                  onClick={() => setLoop(v => !v)}
+                  style={{ width: 48, height: 24, borderRadius: 12, cursor: "pointer", position: "relative", flexShrink: 0, background: loop ? "linear-gradient(135deg,#a78bfa,#f472b6)" : "#e2e8f0", transition: "background 0.3s" }}
+                >
+                  <div style={{ position: "absolute", top: 2, width: 20, height: 20, background: "white", borderRadius: "50%", transition: "transform 0.3s", transform: loop ? "translateX(26px)" : "translateX(2px)", boxShadow: "0 2px 5px rgba(0,0,0,0.2)" }} />
+                </div>
+              </div>
+
+              {/* Summary of what will be encoded */}
+              <div style={{ background: "rgba(167,139,250,0.08)", borderRadius: 12, padding: "10px 12px", fontSize: 11, color: "#64748b", fontWeight: 700, lineHeight: 1.7 }}>
+                <span style={{ color: "#7c3aed" }}>Will encode:</span><br />
+                {Math.ceil(fps * duration)} frames · {fps}fps · {duration}s · {animSpeed.toFixed(2)}× speed · quality {quality} · {loop ? "looping" : "no loop"}
+              </div>
+            </div>
+          )}
+
+          {/* Action area */}
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
-            {phase === "idle" && <button className="mbtn" style={{ ...S.mainBtn, opacity: libStatus !== "ready" ? 0.5 : 1, cursor: libStatus !== "ready" ? "not-allowed" : "pointer" }} onClick={convert}>✦ Convert — {W}×{H}px</button>}
-            {isConverting && <div style={{ display: "flex", flexDirection: "column", gap: 8 }}><div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ fontWeight: 700, fontSize: 12, color: "#64748b" }}>{phase === "capturing" ? "📸 Capturing frames" : "🔄 Encoding GIF"}</span><span style={{ fontWeight: 900, fontSize: 13, color: "#a78bfa" }}>{progress}%</span></div><div style={S.track}><div style={{ ...S.fill, width: `${progress}%` }} /></div><p style={{ fontSize: 11, color: "#94a3b8", margin: 0, fontWeight: 600, textAlign: "center" }}>{phase === "capturing" ? `Frame ${Math.min(totalFrames, Math.max(1, Math.round((progress / 60) * totalFrames)))} of ${totalFrames}` : "Building GIF…"}</p></div>}
-            {phase === "done" && <button className="mbtn" style={{ ...S.mainBtn, background: "linear-gradient(135deg,#818cf8,#a78bfa)" }} onClick={reset}>↺ Convert Another</button>}
-            {phase === "error" && <><p style={{ fontSize: 12, color: "#ef4444", fontWeight: 700, textAlign: "center", margin: 0 }}>⚠ {errorMsg || "Capture failed"}</p><button className="mbtn" style={{ ...S.mainBtn, background: "linear-gradient(135deg,#f87171,#fb923c)" }} onClick={reset}>↺ Try Again</button></>}
+            {phase === "idle" && (
+              <button
+                className="mbtn"
+                style={{ ...S.mainBtn, opacity: libStatus !== "ready" ? 0.5 : 1, cursor: libStatus !== "ready" ? "not-allowed" : "pointer" }}
+                onClick={convert}
+              >
+                ✦ Convert — {W}×{H}px
+              </button>
+            )}
+
+            {isConverting && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ fontWeight: 700, fontSize: 12, color: "#64748b" }}>
+                    {phase === "capturing" ? "📸 Capturing frames" : "🔄 Encoding GIF"}
+                  </span>
+                  <span style={{ fontWeight: 900, fontSize: 13, color: "#a78bfa" }}>{progress}%</span>
+                </div>
+                <div style={S.track}>
+                  <div style={{ ...S.fill, width: `${progress}%` }} />
+                </div>
+                <p style={{ fontSize: 11, color: "#94a3b8", margin: 0, fontWeight: 600, textAlign: "center" }}>
+                  {phase === "capturing"
+                    ? `Frame ${capturedFrameCount} of ${totalFrames} · ${fps}fps · ${duration}s`
+                    : `Building GIF — ${totalFrames} frames at ${fps}fps…`}
+                </p>
+              </div>
+            )}
+
+            {phase === "done" && (
+              <button className="mbtn" style={{ ...S.mainBtn, background: "linear-gradient(135deg,#818cf8,#a78bfa)" }} onClick={reset}>
+                ↺ Convert Another
+              </button>
+            )}
+
+            {phase === "error" && (
+              <>
+                <p style={{ fontSize: 12, color: "#ef4444", fontWeight: 700, textAlign: "center", margin: 0 }}>⚠ {errorMsg || "Capture failed"}</p>
+                <button className="mbtn" style={{ ...S.mainBtn, background: "linear-gradient(135deg,#f87171,#fb923c)" }} onClick={reset}>↺ Try Again</button>
+              </>
+            )}
           </div>
         </div>
+
+        {/* Right: preview + output */}
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div style={S.card}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}><span style={S.cardLabel}>Live Preview</span><div style={{ display: "flex", gap: 6 }}><span style={S.pill}>{tpl.label}</span><span style={S.pill}>{W}×{H}</span></div></div><div style={{ width: "100%", paddingTop: `${aspectPct}%`, position: "relative", borderRadius: 14, overflow: "hidden", background: "#0a0a0a", border: "2px solid #1a1a2a" }}><iframe srcDoc={previewSrcDoc} title="Live Preview" sandbox="allow-scripts allow-same-origin" style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", border: "none", display: "block" }} /></div><p style={S.hint}>Preview scales to fit. GIF renders from the rendered artboard and scales to {W}×{H}px.</p></div>
-          {gifUrl && <div style={{ ...S.card, borderColor: "rgba(52,211,153,0.35)", background: "rgba(240,253,244,0.92)" }}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}><span style={S.cardLabel}>Output GIF</span><span style={{ ...S.pill, background: "#bbf7d0", color: "#14532d" }}>✓ {W}×{H}px</span></div><div style={{ width: "100%", paddingTop: `${aspectPct}%`, position: "relative", borderRadius: 12, overflow: "hidden", background: "#000" }}><img src={gifUrl} alt="GIF output" style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", objectFit: "cover" }} /></div><button className="mbtn" onClick={download} style={{ ...S.mainBtn, marginTop: 4, background: "linear-gradient(135deg,#34d399,#0ea5e9)", boxShadow: "0 5px 18px rgba(52,211,153,0.35)" }}>↓ Download {tpl.label} GIF — {W}×{H}px</button></div>}
-          {!gifUrl && phase === "idle" && <div style={{ ...S.card, border: "2px dashed #e2e8f0", background: "rgba(255,255,255,0.4)", alignItems: "center", justifyContent: "center", minHeight: 80, textAlign: "center" }}><p style={{ margin: 0, fontSize: 11, color: "#94a3b8", fontWeight: 700 }}>GIF preview appears here after conversion</p></div>}
+          <div style={S.card}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={S.cardLabel}>Live Preview</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <span style={S.pill}>{tpl.label}</span>
+                <span style={S.pill}>{W}×{H}</span>
+              </div>
+            </div>
+            <div style={{ width: "100%", paddingTop: `${aspectPct}%`, position: "relative", borderRadius: 14, overflow: "hidden", background: "#0a0a0a", border: "2px solid #1a1a2a" }}>
+              <iframe
+                srcDoc={previewSrcDoc}
+                title="Live Preview"
+                sandbox="allow-scripts allow-same-origin"
+                style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", border: "none", display: "block" }}
+              />
+            </div>
+            <p style={S.hint}>Preview scales to fit. GIF renders at full {W}×{H}px.</p>
+          </div>
+
+          {gifUrl && (
+            <div style={{ ...S.card, borderColor: "rgba(52,211,153,0.35)", background: "rgba(240,253,244,0.92)" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                <span style={S.cardLabel}>Output GIF</span>
+                <span style={{ ...S.pill, background: "#bbf7d0", color: "#14532d" }}>✓ {W}×{H}px · {totalFrames}f · {fps}fps</span>
+              </div>
+              <div style={{ width: "100%", paddingTop: `${aspectPct}%`, position: "relative", borderRadius: 12, overflow: "hidden", background: "#000" }}>
+                <img src={gifUrl} alt="GIF output" style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", objectFit: "cover" }} />
+              </div>
+              <button className="mbtn" onClick={download} style={{ ...S.mainBtn, marginTop: 4, background: "linear-gradient(135deg,#34d399,#0ea5e9)", boxShadow: "0 5px 18px rgba(52,211,153,0.35)" }}>
+                ↓ Download {tpl.label} GIF — {W}×{H}px
+              </button>
+            </div>
+          )}
+
+          {!gifUrl && phase === "idle" && (
+            <div style={{ ...S.card, border: "2px dashed #e2e8f0", background: "rgba(255,255,255,0.4)", alignItems: "center", justifyContent: "center", minHeight: 80, textAlign: "center" }}>
+              <p style={{ margin: 0, fontSize: 11, color: "#94a3b8", fontWeight: 700 }}>GIF preview appears here after conversion</p>
+            </div>
+          )}
         </div>
       </div>
     </div>
